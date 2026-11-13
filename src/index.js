@@ -17,7 +17,7 @@ const pkg = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf8"))
 const DEBUG = process.env.ZENTAO_DEBUG === "true";
 const ALLOW_INSECURE_HTTP = String(process.env.ZENTAO_ALLOW_INSECURE_HTTP || "false").toLowerCase() === "true";
 const READ_ONLY = process.env.ZENTAO_READ_ONLY === "true";
-const WRITE_TOOLS = new Set(['resolve_bug','batch_resolve_my_bugs','close_bug','verify_bug','comment_bug','upload_attachment']);
+const WRITE_TOOLS = new Set(['resolve_bug','batch_resolve_my_bugs','close_bug','verify_bug','comment_bug','add_bug_comment','edit_bug_comment','upload_attachment']);
 
 function log(...args) {
   if (DEBUG) {
@@ -31,6 +31,7 @@ function sanitizeToolArgs(toolName, args) {
     "body",
     "query",
     "comment",
+    "lastComment",
     "solution",
     "solutionModules",
     "rootCause",
@@ -131,6 +132,7 @@ function getConfigFromEnv() {
     defaultProjectSetId,
     defaultProjectId,
     defaultResolvedBuild,
+    defaultAssignedTo: process.env.ZENTAO_DEFAULT_ASSIGNED_TO || undefined,
     myBugsPath,
     bugsFallbackPaths,
     projectSetBugsPaths,
@@ -213,6 +215,7 @@ async function main() {
 
       if (toolName === "resolve_bug") {
         const resp = await zentao.resolveBug({
+          assignedTo: args.assignedTo,
           id: args.id,
           resolution: args.resolution || "fixed",
           resolvedBuild: args.resolvedBuild,
@@ -225,6 +228,7 @@ async function main() {
 
       if (toolName === "batch_resolve_my_bugs") {
         const resp = await zentao.batchResolveMyBugs({
+          assignedTo: args.assignedTo,
           status: args.status || "active",
           keyword: args.keyword || "",
           limit: args.limit,
@@ -261,13 +265,18 @@ async function main() {
         return toMcpTextResult(JSON.stringify(resp, null, 2));
       }
 
-      if (toolName === "comment_bug") {
+      if (toolName === "comment_bug" || toolName === "add_bug_comment") {
         const resp = await zentao.commentBug({
           id: args.id,
           comment: args.comment || "",
           solutionModules: args.solutionModules,
         });
-        return toMcpTextResult(JSON.stringify(resp, null, 2));
+        return toMcpTextResult(JSON.stringify(resp, null, 2), {isError: !resp.verified});
+      }
+
+      if (toolName === 'edit_bug_comment') {
+        const resp = await zentao.editBugComment({id: args.id, actionId: args.actionId, comment: args.comment});
+        return toMcpTextResult(JSON.stringify(resp, null, 2), {isError: !resp.verified});
       }
 
       if (toolName === "upload_attachment") {

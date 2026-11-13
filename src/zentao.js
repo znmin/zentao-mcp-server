@@ -1,3 +1,4 @@
+import { createCommentClient } from './comments.js';
 import { uploadAttachment, deploymentUrl } from './attachments.js';
 import { resolveSolutionText, normalizeSolutionModules, formatSolutionModules } from "./solution.js";
 
@@ -1362,6 +1363,7 @@ export function createZenTaoClient(config) {
 
   async function resolveBug({
     id,
+    assignedTo,
     resolution = "fixed",
     resolvedBuild,
     solutionModules,
@@ -1398,7 +1400,14 @@ export function createZenTaoClient(config) {
       comment,
       resolution: resolvedValue,
     });
+    const oldBug = (await call({path: `/bugs/${bugId}`})).data;
+    const accountOf = user => typeof user === 'string' ? user : user?.account;
+    const target = assignedTo ?? config.defaultAssignedTo ?? accountOf(oldBug.openedBy);
+    if (typeof target !== 'string' || !target.trim() || target === 'closed' || /[\s<>]/.test(target)) {
+      throw new Error('Cannot determine a valid recipient. Pass assignedTo (ZenTao account), or set ZENTAO_DEFAULT_ASSIGNED_TO; otherwise the Bug creator is used.');
+    }
     const body = {
+      assignedTo: target,
       resolution: resolvedValue,
       resolvedBuild: buildValue,
       comment: resolutionPayload.comment,
@@ -1406,17 +1415,10 @@ export function createZenTaoClient(config) {
     };
 
     const resp = await call({ path: resolvePath, method: "POST", body });
+    let assignedToVerified = false;
+    try { assignedToVerified = accountOf((await call({path: `/bugs/${bugId}`})).data.assignedTo) === target; } catch {}
 
-    // Auto-post the solution/comment text as a separate reply so it appears
-    // in the bug discussion, not just in the resolve action record.
-    let autoComment;
-    if (resolutionPayload.solutionSource !== "fallback" && resolutionPayload.comment) {
-      try {
-        autoComment = await commentBug({ id: bugId, comment: resolutionPayload.comment });
-      } catch (_) {
-        autoComment = { commented: false, error: "auto-comment failed, resolve succeeded" };
-      }
-    }
+    const autoComment = { commented: false, reason: 'Explanation is already stored in the resolve action; no duplicate comment is posted' };
 
     const suggestion =
       resolutionPayload.solutionSource !== "modules" && resolutionPayload.solutionSource !== "fallback"
@@ -1428,6 +1430,9 @@ export function createZenTaoClient(config) {
     return {
       id: bugId,
       resolved: true,
+      assignedTo: target,
+      assignedToVerified,
+      ...(!assignedToVerified ? {warning: 'Resolve submitted but recipient read-back did not match; inspect Bug before retrying', doNotRetryResolve: true} : {}),
       resolution: resolvedValue,
       resolvedBuild: buildValue,
       solution: resolutionPayload.solution,
@@ -1507,49 +1512,14 @@ export function createZenTaoClient(config) {
     };
   }
 
-  async function commentBug({ id, comment, solutionModules } = {}) {
-    const bugId = Number(id);
-    if (!Number.isFinite(bugId) || bugId < 1) {
-      throw new Error("commentBug requires a valid bug id");
-    }
-
-    const formattedModules = formatSolutionModules(solutionModules);
-    if (!formattedModules) {
-      throw new Error(
-        "commentBug REQUIRES non-empty solutionModules {rootCause, fixApproach, logicChange, impact} to write 【根因】【修复思路】【改动逻辑】【影响范围】 template text. " +
-        "Plain comment without solutionModules is no longer accepted."
-      );
-    }
-    const text = formattedModules;
-
-    const primaryPath = buildBugCommentPath({ id: bugId });
-    const body = { comment: text };
-    try {
-      const resp = await call({ path: primaryPath, method: "POST", body });
-      return {
-        id: bugId,
-        commented: true,
-        comment: text,
-        solutionSource: formattedModules ? "modules" : "comment",
-        raw: { status: resp.status, path: primaryPath },
-      };
-    } catch (err) {
-      const fallbackPath = primaryPath.replace(/\/comment$/, "/comments");
-      if (fallbackPath !== primaryPath && Number(err?.status) === 404) {
-        const resp = await call({ path: fallbackPath, method: "POST", body });
-        return {
-          id: bugId,
-          commented: true,
-          comment: text,
-          solutionSource: formattedModules ? "modules" : "comment",
-          raw: { status: resp.status, path: fallbackPath },
-        };
-      }
-      throw err;
-    }
+  const commentClient = createCommentClient({baseUrl: normalizedBaseUrl, auth, timeoutMs, tokenTtlMs, call});
+  async function commentBug({id,comment,solutionModules} = {}) {
+    const text = formatSolutionModules(solutionModules) || comment;
+    return commentClient.write({id,comment:text});
   }
-
+  async function editBugComment(args) { return commentClient.write(args); }
   async function batchResolveMyBugs({
+    assignedTo,
     status = "active",
     keyword = "",
     limit = 50,
@@ -1598,6 +1568,7 @@ export function createZenTaoClient(config) {
       }
       try {
         const result = await resolveBug({
+          assignedTo,
           id: bugId,
           resolution,
           resolvedBuild,
@@ -1701,7 +1672,7 @@ export function createZenTaoClient(config) {
     resolveBug,
     closeBug,
     verifyBug,
-    commentBug,
+    commentBug, editBugComment,
     batchResolveMyBugs,
     uploadFile,
     downloadFile,

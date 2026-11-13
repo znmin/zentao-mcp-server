@@ -283,9 +283,32 @@ export const TOOLS = [
   },
 ];
 
+for (const tool of TOOLS) {
+  if (tool.name === 'resolve_bug' || tool.name === 'batch_resolve_my_bugs') {
+    tool.inputSchema.properties.assignedTo = {type:'string',minLength:1,description:'Recipient ZenTao account, not display name. Explicit value overrides ZENTAO_DEFAULT_ASSIGNED_TO; otherwise defaults to each Bug creator (openedBy). ZenTao sends @ notification only if this user has configured mobile/notification binding.'};
+  }
+  if (tool.name === 'comment_bug') {
+    tool.description = 'Add a Bug comment without changing its fields or state. Accepts free text/HTML in comment or optional structured solutionModules. Uses the authenticated page action API and verifies the saved action.';
+    tool.inputSchema.properties.comment.description = 'Free-text or HTML comment; no four-section template required. Non-empty solutionModules takes precedence if both are supplied.';
+    tool.inputSchema.properties.solutionModules.description = 'Optional structured explanation; omit for ordinary remarks.';
+  }
+}
+TOOLS.push({
+  name:'add_bug_comment',description:'Add an ordinary free-text/HTML Bug remark and verify it in action history. Does not resolve, reassign or edit Bug fields.',
+  inputSchema:{type:'object',properties:{id:{type:'integer',minimum:1},comment:{type:'string',minLength:1}},required:['id','comment'],additionalProperties:false},
+},{
+  name:'edit_bug_comment',description:'Edit an existing comment action belonging to this Bug. Get actionId from get_bug_actions first; cannot edit resolve/close/assign actions. Server permissions still apply.',
+  inputSchema:{type:'object',properties:{id:{type:'integer',minimum:1},actionId:{type:'integer',minimum:1},comment:{type:'string',minLength:1}},required:['id','actionId','comment'],additionalProperties:false},
+});
+
 export function assertToolArgs(name, args) {
   if (args == null) return;
   if (typeof args !== "object") throw new Error(`Invalid arguments for ${name}: expected object`);
+  if ((name === 'resolve_bug' || name === 'batch_resolve_my_bugs') && args.assignedTo !== undefined && (typeof args.assignedTo !== 'string' || !args.assignedTo.trim() || args.assignedTo === 'closed' || /[\s<>]/.test(args.assignedTo))) throw new Error('assignedTo must be a non-empty ZenTao account');
+  if (name === 'add_bug_comment' || name === 'edit_bug_comment') {
+    if (!Number.isSafeInteger(args.id) || args.id < 1 || typeof args.comment !== 'string' || !args.comment.trim()) throw new Error('id and non-empty comment are required');
+    if (name === 'edit_bug_comment' && (!Number.isSafeInteger(args.actionId) || args.actionId < 1)) throw new Error('actionId must be a positive integer');
+  }
   if (name === "get_my_bugs") {
     if (args.limit !== undefined && (!Number.isFinite(args.limit) || args.limit < 1 || args.limit > 200)) {
       throw new Error("get_my_bugs.limit must be a number between 1 and 200");
@@ -408,9 +431,7 @@ export function assertToolArgs(name, args) {
     if (!Number.isFinite(args.id) || Number(args.id) < 1) {
       throw new Error("comment_bug.id must be a number >= 1");
     }
-    if (!args.solutionModules || typeof args.solutionModules !== "object") {
-      throw new Error("comment_bug REQUIRES solutionModules {rootCause, fixApproach, logicChange, impact}; plain comment is no longer accepted");
-    }
+    if (!(typeof args.comment === 'string' && args.comment.trim()) && !args.solutionModules) throw new Error('comment_bug requires comment or solutionModules');
     if (args.path !== undefined) {
       throw new Error("comment_bug.path is no longer supported");
     }

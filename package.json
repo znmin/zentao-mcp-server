@@ -1,6 +1,6 @@
 {
   "name": "@znmin/zentao-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "ZenTao MCP server with preset scope, bug workflows and verified REST v2 attachment uploads",
   "type": "module",
   "bin": { "zentao-mcp-server": "bin/zentao-mcp-server.js" },
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test test/client.test.js test/mcp.test.js",
-    "lint": "node --check src/index.js && node --check src/zentao.js && node --check src/attachments.js",
+    "lint": "node --check src/index.js && node --check src/zentao.js && node --check src/attachments.js && node --check src/comments.js",
     "prepublishOnly": "npm run lint && npm test"
   },
   "dependencies": { "@modelcontextprotocol/sdk": "1.32.2" },

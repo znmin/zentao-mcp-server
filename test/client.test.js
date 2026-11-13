@@ -104,4 +104,50 @@ test('resolve workflow uses resolve endpoint and structured explanation',async t
   const request=requests.find(r=>r.path.endsWith('/resolve'));
   assert.equal(request.method,'POST');const body=JSON.parse(request.body);
   assert.equal(body.resolvedBuild,'trunk');assert.match(body.comment,/根因/);assert.match(body.comment,/Invalid amount accepted/);
+  assert.equal(body.assignedTo,'reporter');
+  assert.equal(requests.some(r=>r.path.includes('/comments')||r.path.includes('f=comment')),false);
+});
+
+test('resolve explicit recipient and environment default override creator and are verified',async t=>{
+  const {client,requests}=await fixture(t,{config:{defaultAssignedTo:'qa-default'}});
+  const solutionModules={rootCause:'Cause',fixApproach:'Fix',logicChange:'Logic',impact:'Impact'};
+  const first=await client.resolveBug({id:7,solutionModules});assert.equal(first.assignedTo,'qa-default');assert.equal(first.assignedToVerified,true);
+  const second=await client.resolveBug({id:7,assignedTo:'qa-explicit',solutionModules});assert.equal(second.assignedToVerified,true);assert.equal(second.assignedTo,'qa-explicit');
+  assert.equal(JSON.parse(requests.filter(r=>r.path.endsWith('/resolve')).at(-1).body).assignedTo,'qa-explicit');
+});
+
+test('invalid recipient never submits a resolve mutation',async t=>{
+  const {client,requests}=await fixture(t);
+  await assert.rejects(()=>client.resolveBug({id:7,assignedTo:'',solutionModules:{rootCause:'Cause'}}),/recipient/);
+  assert.equal(requests.some(r=>r.path.endsWith('/resolve')),false);
+});
+
+test('ordinary remarks and editing use authenticated form endpoints and verified history',async t=>{
+  const {client,requests}=await fixture(t,{prefix:'/zentao'});
+  const result=await client.commentBug({id:7,comment:'Ordinary remark, no four-section template'});
+  assert.equal(result.verified,true);assert.equal(result.actionId,101);
+  const edited=await client.editBugComment({id:7,actionId:101,comment:'Updated remark'});assert.equal(edited.verified,true);assert.equal(edited.edited,true);
+  const writes=requests.filter(r=>r.path.includes('m=action'));
+  assert.equal(writes.length,2);assert.equal(writes[0].headers.cookie,'zentaosid=test-web-session');
+  assert.match(writes[0].headers.referer,/\/zentao\/index.php$/);
+  assert.equal(requests.some(r=>r.path.includes('/comments')),false);
+  assert.equal(requests.filter(r=>r.path.includes('f=login')).length,1);
+  assert.equal(requests.some(r=>r.path.includes('test-web-session')||r.path.includes('fake-password')),false);
+});
+
+test('editing an action outside this Bug or a non-comment action is rejected',async t=>{
+  const {client,requests}=await fixture(t);
+  await assert.rejects(()=>client.editBugComment({id:7,actionId:999,comment:'Wrong action'}),/belonging/);
+  assert.equal(requests.some(r=>r.path.includes('m=action')),false);
+});
+
+test('a success response without saved comment is not reported as verified',async t=>{
+  const {client}=await fixture(t,{handler:(req,res)=>{if(!req.url.includes('m=action'))return false;res.end('{"status":"success"}');return true;}});
+  const result=await client.commentBug({id:7,comment:'Not persisted'});assert.equal(result.verified,false);assert.equal(result.doNotRetryWrite,true);
+});
+
+test('login rejection prevents any remark write',async t=>{
+  const {client,requests}=await fixture(t,{handler:(req,res)=>{if(!req.url.includes('f=login'))return false;res.end('{"result":false,"load":"login"}');return true;}});
+  await assert.rejects(()=>client.commentBug({id:7,comment:'Blocked'}),/rejected/);
+  assert.equal(requests.some(r=>r.path.includes('m=action')),false);
 });

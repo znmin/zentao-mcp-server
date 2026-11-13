@@ -1,7 +1,7 @@
 # @znmin/zentao-mcp-server
 
 你自己维护的禅道 MCP Server，支持 `npx` 启动、账号密码自动换取 Token，以及完整 Bug 工作流。
-基于 `@aipper/zentao-mcp-server@0.1.26` 的 MIT 代码维护，保留 12 个工具和已有环境变量，便于迁移。
+基于 `@aipper/zentao-mcp-server@0.1.26` 的 MIT 代码维护，兼容原有工具和环境变量，现提供 14 个工具，便于迁移。
 
 ## 快速接入
 
@@ -12,7 +12,7 @@
   "mcpServers": {
     "zentao": {
       "command": "npx",
-      "args": ["-y", "@znmin/zentao-mcp-server@1.0.0"],
+      "args": ["-y", "@znmin/zentao-mcp-server@1.1.0"],
       "env": {
         "ZENTAO_BASE_URL": "https://zentao.example.com",
         "ZENTAO_ACCOUNT": "your-account",
@@ -25,7 +25,7 @@
 
 如果使用内网 HTTP，另外设置 `ZENTAO_ALLOW_INSECURE_HTTP=true`。
 Windows 客户端无法直接找到 `npx` 时，使用 `command: "cmd"`，
-`args: ["/d", "/c", "npx", "-y", "@znmin/zentao-mcp-server@1.0.0"]`。
+`args: ["/d", "/c", "npx", "-y", "@znmin/zentao-mcp-server@1.1.0"]`。
 
 从上游迁移：只需将启动包名从 `@aipper/zentao-mcp-server` 改为本包，保留现有 `ZENTAO_*` 配置。
 服务端和 CLI 不需要安装到禅道服务器上；MCP 运行在 Agent Runtime 所在电脑，附件路径也是该电脑上的路径。
@@ -67,7 +67,9 @@ multipart/form-data:
 | `batch_resolve_my_bugs` | 批量解决当前账号的 Bug |
 | `close_bug` | 关闭 Bug |
 | `verify_bug` | 验证通过关闭，失败激活 |
-| `comment_bug` | 写入结构化备注 |
+| `comment_bug` | 普通文本/HTML 或结构化备注 |
+| `add_bug_comment` | 新增普通备注，无需四段模板 |
+| `edit_bug_comment` | 编辑本 Bug 的既有备注动作 |
 | `upload_attachment` | 上传文件并验证 Bug 附件关联 |
 | `download_attachment` | 通过文件 ID 下载到 Runtime 本地路径 |
 
@@ -97,6 +99,7 @@ multipart/form-data:
 | `ZENTAO_PRODUCT_ID` | 无 | 默认产品范围 |
 | `ZENTAO_PROJECT_ID` | 无 | 默认项目范围 |
 | `ZENTAO_PROJECT_SET_ID` | 无 | 默认项目集范围 |
+| `ZENTAO_DEFAULT_ASSIGNED_TO` | 无 | 解决 Bug 的默认接收账号；未配置时转回创建人，工具 assignedTo 参数优先 |
 | `ZENTAO_DEFAULT_RESOLVED_BUILD` | `trunk` | 默认解决版本 |
 | `ZENTAO_MY_BUGS_PATH` | 自动 | 自定义“我的 Bug”路径 |
 | `ZENTAO_BUGS_FALLBACK_PATHS` | 自动 | 逗号分隔的候选列表路径 |
@@ -127,3 +130,25 @@ GitHub CI 在 Windows / Ubuntu 和 Node.js 20 / 24 上运行。
 
 MIT。上游版权保留于 [LICENSE](LICENSE)，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 官方接口：[附件上传说明](https://www.zentao.net/book/api/post-files-2325.html)。
+
+## 1.1.0 转交人员与备注
+
+`resolve_bug` 和 `batch_resolve_my_bugs` 支持 `assignedTo`（禅道账号，不是中文显示名）。
+优先级：工具参数 > `ZENTAO_DEFAULT_ASSIGNED_TO` > 该 Bug 的创建人 `openedBy`。
+无法确定有效接收人时拒绝提交解决操作；解决后回读指派人，未确认时返回明确警告，不自动重复解决。
+批量操作未指定统一账号时，每条 Bug 分别回到自己的创建人。
+禅道是否能 @到该人还取决于其手机号、通知绑定和 Webhook 设置，本 MCP 不直接发送企业微信消息。
+禅道 22.0 API 通知链接丢域名的问题仍需要在禅道服务端修复，本次不会修改服务端。
+
+普通备注：`add_bug_comment({"id":7,"comment":"这里填写普通备注或富文本"})`。
+原 `comment_bug` 也支持普通 comment；若提供非空 solutionModules 则优先格式化它。
+备注编辑：`edit_bug_comment({"id":7,"actionId":101,"comment":"修改后的备注"})`。
+actionId 来自 `get_bug_actions` 或新增备注的返回值；只能编辑属于该 Bug 的 commented 动作，不能编辑解决、指派等系统动作。
+
+备注操作使用同一账号的独立页面登录会话：先访问 `index.php?m=api&f=getSessionID&t=json`，
+再 POST 用户登录，随后调用 action.comment / action.editComment。密码仅放在 POST 请求体，
+会话仅通过 Cookie 发送，不把凭证放在 URL 中。所有请求限定在配置的部署地址，拒绝重定向。
+服务端权限、登录策略或验证码可能使页面接口不可用；此时返回错误，不会改用 Bug 字段编辑来冒充备注。
+页面接口有时返回 reload 脚本，本 MCP 不执行该脚本，仅通过 Bug 动作历史确认写入结果。
+提交后回读失败时保留不确定状态并提示先检查历史，不自动重试写入，避免重复备注。
+解决 Bug 不再自动追加一条重复备注，四段说明保存在解决动作中。
