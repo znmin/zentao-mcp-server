@@ -1,0 +1,323 @@
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  TOOLS,
+  assertToolArgs,
+  toMcpTextResult,
+} from "./tools.js";
+import { createZenTaoClient } from "./zentao.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf8"));
+
+const DEBUG = process.env.ZENTAO_DEBUG === "true";
+const ALLOW_INSECURE_HTTP = String(process.env.ZENTAO_ALLOW_INSECURE_HTTP || "false").toLowerCase() === "true";
+const READ_ONLY = process.env.ZENTAO_READ_ONLY === "true";
+const WRITE_TOOLS = new Set(['resolve_bug','batch_resolve_my_bugs','close_bug','verify_bug','comment_bug','upload_attachment']);
+
+function log(...args) {
+  if (DEBUG) {
+    process.stderr.write(`[zentao-mcp] ${args.join(" ")}\n`);
+  }
+}
+
+function sanitizeToolArgs(toolName, args) {
+  if (!args || typeof args !== "object") return {};
+  const redactedKeys = new Set([
+    "body",
+    "query",
+    "comment",
+    "solution",
+    "solutionModules",
+    "rootCause",
+    "fixApproach",
+    "logicChange",
+    "impact",
+    "password",
+    "token",
+  ]);
+  const sanitized = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (redactedKeys.has(key)) {
+      sanitized[key] = "<redacted>";
+      continue;
+    }
+    if (toolName === "get_token" && key === "force") {
+      sanitized[key] = Boolean(value);
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+
+const KNOWN_TOOL_NAMES = new Set([
+  "get_token",
+  "list_my_projects",
+  "get_my_bugs",
+  "get_bug_detail",
+  "get_bug_actions",
+  "resolve_bug",
+  "batch_resolve_my_bugs",
+  "close_bug",
+  "verify_bug",
+  "comment_bug",
+  "upload_attachment",
+  "download_attachment",
+]);
+
+function normalizeToolName(rawName) {
+  if (!rawName || typeof rawName !== "string") return rawName;
+  return KNOWN_TOOL_NAMES.has(rawName) ? rawName : rawName;
+}
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required env: ${name}`);
+
+  if (name === "ZENTAO_BASE_URL" && value.startsWith("http://")) {
+    if (!ALLOW_INSECURE_HTTP) {
+      throw new Error("ZENTAO_BASE_URL must use HTTPS unless ZENTAO_ALLOW_INSECURE_HTTP=true");
+    }
+  }
+  if (name === "ZENTAO_BASE_URL" && !/^https?:\/\//i.test(value)) {
+    throw new Error("ZENTAO_BASE_URL must start with http:// or https://");
+  }
+
+  return value;
+}
+
+function getConfigFromEnv() {
+  const baseUrl = requireEnv("ZENTAO_BASE_URL").replace(/\/+$/, "");
+  const apiPrefix = (process.env.ZENTAO_API_PREFIX || "/api.php/v1").replace(/\/+$/, "");
+  const tokenPath = process.env.ZENTAO_TOKEN_PATH || `${apiPrefix}/tokens`;
+  const tokenTtlMs = Number(process.env.ZENTAO_TOKEN_TTL_MS || "3000000");
+  const timeoutMs = Number(process.env.ZENTAO_HTTP_TIMEOUT_MS || "30000");
+  const maxUploadBytes = Number(process.env.ZENTAO_MAX_UPLOAD_BYTES || '52428800');
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000) throw new Error('ZENTAO_HTTP_TIMEOUT_MS must be an integer between 1 and 300000');
+  if (!Number.isSafeInteger(tokenTtlMs) || tokenTtlMs < 1) throw new Error('ZENTAO_TOKEN_TTL_MS must be a positive integer');
+  if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1) throw new Error('ZENTAO_MAX_UPLOAD_BYTES must be a positive integer');
+  const defaultProductId = Number(process.env.ZENTAO_PRODUCT_ID || "0") || null;
+  const defaultProjectSetId = Number(process.env.ZENTAO_PROJECT_SET_ID || "0") || null;
+  const defaultProjectId = Number(process.env.ZENTAO_PROJECT_ID || "0") || null;
+  const defaultResolvedBuild = String(process.env.ZENTAO_DEFAULT_RESOLVED_BUILD || "trunk").trim();
+  const myBugsPath = String(process.env.ZENTAO_MY_BUGS_PATH || "").trim();
+  const bugsFallbackPaths = String(process.env.ZENTAO_BUGS_FALLBACK_PATHS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const projectSetBugsPaths = String(process.env.ZENTAO_PROJECT_SET_BUGS_PATHS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  const account = requireEnv("ZENTAO_ACCOUNT");
+  const password = requireEnv("ZENTAO_PASSWORD");
+
+  return {
+    baseUrl,
+    apiPrefix,
+    tokenPath,
+    tokenTtlMs,
+    timeoutMs,
+    maxUploadBytes,
+    uploadPath: process.env.ZENTAO_UPLOAD_PATH || '/api.php/v2/files',
+    allowInsecureHttp: ALLOW_INSECURE_HTTP,
+    defaultProductId,
+    defaultProjectSetId,
+    defaultProjectId,
+    defaultResolvedBuild,
+    myBugsPath,
+    bugsFallbackPaths,
+    projectSetBugsPaths,
+    auth: { account, password },
+  };
+}
+
+async function main() {
+  log("Starting zentao-mcp-server version", pkg.version);
+
+  const config = getConfigFromEnv();
+  log("Config loaded");
+
+  const zentao = createZenTaoClient(config);
+
+  const server = new Server(
+    { name: pkg.name, version: pkg.version },
+    { capabilities: { tools: {} } }
+  );
+
+  log("MCP server initialized");
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS.filter(tool => !READ_ONLY || !WRITE_TOOLS.has(tool.name)) };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const rawToolName = req.params?.name;
+    const toolName = normalizeToolName(rawToolName);
+    const args = req.params?.arguments || {};
+
+    log(`Tool call: ${toolName}`, JSON.stringify(sanitizeToolArgs(toolName, args)));
+
+    try {
+      if (READ_ONLY && WRITE_TOOLS.has(toolName)) throw new Error('ZENTAO_READ_ONLY=true; this write tool is disabled');
+      assertToolArgs(toolName, args);
+
+      if (toolName === "get_token") {
+        const force = Boolean(args.force);
+        const result = await zentao.getToken({ force });
+        const output = {
+          ...result,
+          token: result.token ? `${result.token.slice(0, 6)}…${result.token.slice(-4)}` : "",
+        };
+        return toMcpTextResult(JSON.stringify(output, null, 2));
+      }
+
+      if (toolName === "list_my_projects") {
+        const resp = await zentao.listMyProjects({ keyword: args.keyword || "" });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "get_my_bugs") {
+        const resp = await zentao.getMyBugs({
+          status: args.status || "",
+          keyword: args.keyword || "",
+          limit: args.limit,
+          page: args.page,
+          productId: args.productId,
+          projectId: args.projectId,
+          projectSetId: args.projectSetId,
+          path: args.path || "/bugs",
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "get_bug_detail") {
+        const resp = await zentao.getBugDetail({
+          id: args.id,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "get_bug_actions") {
+        const resp = await zentao.getBugActions({
+          id: args.id,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "resolve_bug") {
+        const resp = await zentao.resolveBug({
+          id: args.id,
+          resolution: args.resolution || "fixed",
+          resolvedBuild: args.resolvedBuild,
+          solutionModules: args.solutionModules,
+          solution: args.solution || "",
+          comment: args.comment || "",
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "batch_resolve_my_bugs") {
+        const resp = await zentao.batchResolveMyBugs({
+          status: args.status || "active",
+          keyword: args.keyword || "",
+          limit: args.limit,
+          page: args.page,
+          productId: args.productId,
+          projectId: args.projectId,
+          projectSetId: args.projectSetId,
+          maxItems: args.maxItems,
+          resolution: args.resolution || "fixed",
+          resolvedBuild: args.resolvedBuild,
+          solutionModules: args.solutionModules,
+          solution: args.solution || "",
+          comment: args.comment || "",
+          path: args.path || "/bugs",
+          stopOnError: args.stopOnError !== undefined ? Boolean(args.stopOnError) : true,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "close_bug") {
+        const resp = await zentao.closeBug({
+          id: args.id,
+          comment: args.comment || "",
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "verify_bug") {
+        const resp = await zentao.verifyBug({
+          id: args.id,
+          result: args.result || "pass",
+          comment: args.comment || "",
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "comment_bug") {
+        const resp = await zentao.commentBug({
+          id: args.id,
+          comment: args.comment || "",
+          solutionModules: args.solutionModules,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      if (toolName === "upload_attachment") {
+        const resp = await zentao.uploadFile({
+          bugId: args.bugId,
+          filePath: args.filePath,
+          fileName: args.fileName,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2), { isError: !resp.linked });
+      }
+
+      if (toolName === "download_attachment") {
+        const resp = await zentao.downloadFile({
+          fileId: args.fileId,
+          savePath: args.savePath,
+        });
+        return toMcpTextResult(JSON.stringify(resp, null, 2));
+      }
+
+      throw new Error(`Unknown tool: ${rawToolName}`);
+    } catch (err) {
+      log(`Tool error: ${toolName}`, err?.message || err);
+
+      const message = String(err?.message || err);
+      const needsResolvedBuild =
+        /resolvedBuild|解决版本/i.test(message) || /resolvedBuild|解决版本/i.test(String(err?.responseText || ""));
+      const errorPayload = {
+        ok: false,
+        tool: rawToolName,
+        message,
+        status: err?.status ?? null,
+        hint: needsResolvedBuild
+          ? "Resolve requires 解决版本: pass resolvedBuild (e.g. trunk) or set ZENTAO_DEFAULT_RESOLVED_BUILD. Do not substitute PUT /bugs/{id} edit for resolve — solutionModules will not be written."
+          : "If you see 'Need product id', set env ZENTAO_PRODUCT_ID or pass productId in get_my_bugs. For project-scoped bugs, set ZENTAO_PROJECT_ID or pass projectId.",
+        hint2: needsResolvedBuild
+          ? "Use resolve_bug / batch_resolve_my_bugs only; they call POST /bugs/{id}/resolve with resolution + resolvedBuild + comment."
+          : "For project-set instances, prefer get_my_bugs with projectSetId or ZENTAO_MY_BUGS_PATH=/my/bug; list_my_projects may miss project sets without concrete projects.",
+      };
+      return toMcpTextResult(JSON.stringify(errorPayload, null, 2), { isError: true });
+    }
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  log("MCP server connected and ready");
+}
+
+main().catch((err) => {
+  // stderr 方便客户端看到启动失败原因
+  process.stderr.write(String(err?.stack || err) + "\n");
+  process.exit(1);
+});
